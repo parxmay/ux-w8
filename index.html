@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Air Sketch — Pointing Draw & Fist Clear</title>
+  
+  <!-- MediaPipe Hands & Camera Utils -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    html, body {
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+      background-color: #000000;
+      user-select: none;
+      cursor: crosshair;
+    }
+
+    /* Video element kept invisible for frame capture only */
+    #webcam-video {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
+      z-index: -1;
+    }
+
+    /* Main Fullscreen Canvas */
+    #main-canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      display: block;
+      background-color: #000000;
+      z-index: 1;
+    }
+
+    /* Minimal initial permission/status hint */
+    #status-hint {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      color: rgba(255, 255, 255, 0.7);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 1.1rem;
+      text-align: center;
+      line-height: 1.8;
+      pointer-events: none;
+      z-index: 10;
+      transition: opacity 0.4s ease;
+    }
+
+    #status-hint.hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    #status-hint small {
+      display: block;
+      font-size: 0.85rem;
+      color: rgba(255, 255, 255, 0.4);
+    }
+  </style>
+</head>
+<body>
+  <!-- Hidden video capture element -->
+  <video id="webcam-video" playsinline muted autoplay></video>
+
+  <!-- Fullscreen display canvas -->
+  <canvas id="main-canvas"></canvas>
+
+  <!-- Minimal status message -->
+  <div id="status-hint">
+    웹캠 및 MediaPipe를 로딩 중입니다...
+    <small>화면을 클릭하면 카메라 권한 요청이 시작됩니다.</small>
+  </div>
+
+  <script>
+    // ==========================================
+    // DOM Elements & Canvas Setup
+    // ==========================================
+    const videoElement = document.getElementById('webcam-video');
+    const mainCanvas = document.getElementById('main-canvas');
+    const mainCtx = mainCanvas.getContext('2d');
+    const statusHint = document.getElementById('status-hint');
+
+    // Offscreen persistent canvas for red drawing strokes
+    const drawCanvas = document.createElement('canvas');
+    const drawCtx = drawCanvas.getContext('2d');
+
+    // Drawing state
+    let lastPoint = null;
+    let fistHoldCounter = 0;
+
+    // Resize handling to keep full window coverage
+    function resizeCanvas() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      // Temporary canvas to preserve existing drawing during window resize
+      const tempCanvas = document.createElement('canvas');
+      tempCanvas.width = drawCanvas.width;
+      tempCanvas.height = drawCanvas.height;
+      const tempCtx = tempCanvas.getContext('2d');
+      if (drawCanvas.width > 0 && drawCanvas.height > 0) {
+        tempCtx.drawImage(drawCanvas, 0, 0);
+      }
+
+      mainCanvas.width = w;
+      mainCanvas.height = h;
+      drawCanvas.width = w;
+      drawCanvas.height = h;
+
+      // Restore drawing onto resized drawCanvas
+      if (tempCanvas.width > 0 && tempCanvas.height > 0) {
+        drawCtx.drawImage(tempCanvas, 0, 0, w, h);
+      }
+    }
+
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    // ==========================================
+    // MediaPipe Hand Skeleton Connections (21 Landmarks)
+    // ==========================================
+    const HAND_CONNECTIONS = [
+      // Thumb
+      [0, 1], [1, 2], [2, 3], [3, 4],
+      // Index
+      [0, 5], [5, 6], [6, 7], [7, 8],
+      // Middle
+      [0, 9], [9, 10], [10, 11], [11, 12],
+      // Ring
+      [0, 13], [13, 14], [14, 15], [15, 16],
+      // Pinky
+      [0, 17], [17, 18], [18, 19], [19, 20],
+      // Palm
+      [5, 9], [9, 13], [13, 17]
+    ];
+
+    // Helper: Convert normalized landmark to screen pixels
+    function toScreenCoords(landmark) {
+      return {
+        x: landmark.x * mainCanvas.width,
+        y: landmark.y * mainCanvas.height
+      };
+    }
+
+    // Euclidean distance in normalized coordinate space
+    function getDistance(p1, p2) {
+      const dx = p1.x - p2.x;
+      const dy = p1.y - p2.y;
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+
+    // ==========================================
+    // Gesture Detection Algorithms
+    // ==========================================
+
+    // 1. Pointing Up: Index extended upward, while Middle, Ring, Pinky are curled/folded
+    function detectPointingUp(landmarks) {
+      const wrist = landmarks[0];
+      const indexTip = landmarks[8];
+      const indexPip = landmarks[6];
+      const indexMcp = landmarks[5];
+
+      const middleTip = landmarks[12];
+      const middlePip = landmarks[10];
+
+      const ringTip = landmarks[16];
+      const ringPip = landmarks[14];
+
+      const pinkyTip = landmarks[20];
+      const pinkyPip = landmarks[18];
+
+      // Index must be pointing upwards on screen (y values are smaller at the top)
+      const isIndexUpward = (indexTip.y < indexPip.y) && (indexPip.y < indexMcp.y);
+
+      // Index finger length must be extended from wrist
+      const distIndexTipWrist = getDistance(indexTip, wrist);
+      const distIndexPipWrist = getDistance(indexPip, wrist);
+      const isIndexExtended = distIndexTipWrist > distIndexPipWrist * 1.15;
+
+      // Middle, Ring, Pinky must be folded (tips closer to wrist or below their respective PIP)
+      const isMiddleFolded = (middleTip.y > middlePip.y) || (getDistance(middleTip, wrist) < getDistance(middlePip, wrist) * 1.05);
+      const isRingFolded   = (ringTip.y > ringPip.y)     || (getDistance(ringTip, wrist) < getDistance(ringPip, wrist) * 1.05);
+      const isPinkyFolded  = (pinkyTip.y > pinkyPip.y)   || (getDistance(pinkyTip, wrist) < getDistance(pinkyPip, wrist) * 1.05);
+
+      return isIndexUpward && isIndexExtended && isMiddleFolded && isRingFolded && isPinkyFolded;
+    }
+
+    // 2. Fist: All 4 fingers (Index, Middle, Ring, Pinky) are curled/folded towards wrist/palm
+    function detectFist(landmarks) {
+      const wrist = landmarks[0];
+
+      const indexTip = landmarks[8];
+      const indexPip = landmarks[6];
+
+      const middleTip = landmarks[12];
+      const middlePip = landmarks[10];
+
+      const ringTip = landmarks[16];
+      const ringPip = landmarks[14];
+
+      const pinkyTip = landmarks[20];
+      const pinkyPip = landmarks[18];
+
+      // Distance from wrist: curled fingers have tip closer to wrist or MCP
+      const indexFolded  = getDistance(indexTip, wrist) < getDistance(indexPip, wrist);
+      const middleFolded = getDistance(middleTip, wrist) < getDistance(middlePip, wrist);
+      const ringFolded   = getDistance(ringTip, wrist) < getDistance(ringPip, wrist);
+      const pinkyFolded  = getDistance(pinkyTip, wrist) < getDistance(pinkyPip, wrist);
+
+      return indexFolded && middleFolded && ringFolded && pinkyFolded;
+    }
+
+    // ==========================================
+    // MediaPipe Results Processing Loop
+    // ==========================================
+    function onResults(results) {
+      // Hide initial loading hint on first frame
+      if (statusHint && !statusHint.classList.contains('hidden')) {
+        statusHint.classList.add('hidden');
+      }
+
+      // 1. Clear main screen with pure black
+      mainCtx.fillStyle = '#000000';
+      mainCtx.fillRect(0, 0, mainCanvas.width, mainCanvas.height);
+
+      let anyPointingUp = false;
+      let anyFist = false;
+
+      // 2. Process detected hand(s)
+      if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        for (const landmarks of results.multiHandLandmarks) {
+          // Check gestures
+          const isPointing = detectPointingUp(landmarks);
+          const isFist = detectFist(landmarks);
+
+          if (isFist) {
+            anyFist = true;
+          }
+
+          if (isPointing) {
+            anyPointingUp = true;
+            const indexTipScreen = toScreenCoords(landmarks[8]);
+
+            // Draw 20px red line onto persistent drawCanvas
+            drawCtx.strokeStyle = '#FF0000';
+            drawCtx.lineWidth = 20;
+            drawCtx.lineCap = 'round';
+            drawCtx.lineJoin = 'round';
+
+            if (lastPoint) {
+              drawCtx.beginPath();
+              drawCtx.moveTo(lastPoint.x, lastPoint.y);
+              drawCtx.lineTo(indexTipScreen.x, indexTipScreen.y);
+              drawCtx.stroke();
+            } else {
+              // First point in stroke: draw a solid 20px dot (radius 10px)
+              drawCtx.beginPath();
+              drawCtx.arc(indexTipScreen.x, indexTipScreen.y, 10, 0, Math.PI * 2);
+              drawCtx.fillStyle = '#FF0000';
+              drawCtx.fill();
+            }
+
+            lastPoint = indexTipScreen;
+          }
+        }
+      }
+
+      // If user is not pointing, reset stroke so next point starts a new path
+      if (!anyPointingUp) {
+        lastPoint = null;
+      }
+
+      // If fist is detected, wipe all drawn lines clean
+      if (anyFist) {
+        fistHoldCounter++;
+        if (fistHoldCounter >= 1) { // Immediate clear on fist detection
+          drawCtx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+          lastPoint = null;
+        }
+      } else {
+        fistHoldCounter = 0;
+      }
+
+      // 3. Render persistent drawn strokes onto main canvas
+      mainCtx.drawImage(drawCanvas, 0, 0);
+
+      // 4. Render Hand Landmarks and Skeleton on top of the black canvas
+      if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        for (const landmarks of results.multiHandLandmarks) {
+          // Convert all 21 points to screen space
+          const points = landmarks.map(lm => toScreenCoords(lm));
+
+          // A. Draw skeleton bones / connections
+          mainCtx.strokeStyle = 'rgba(255, 255, 255, 0.65)';
+          mainCtx.lineWidth = 3;
+          mainCtx.lineCap = 'round';
+
+          for (const [startIdx, endIdx] of HAND_CONNECTIONS) {
+            const p1 = points[startIdx];
+            const p2 = points[endIdx];
+            mainCtx.beginPath();
+            mainCtx.moveTo(p1.x, p1.y);
+            mainCtx.lineTo(p2.x, p2.y);
+            mainCtx.stroke();
+          }
+
+          // B. Draw landmark joints
+          for (let i = 0; i < points.length; i++) {
+            const pt = points[i];
+            mainCtx.beginPath();
+
+            if (i === 8) {
+              // Index Fingertip: Highlights red if pointing up, else cyan
+              const isPointing = detectPointingUp(landmarks);
+              if (isPointing) {
+                // Brush indicator circle (20px diameter / 10px radius)
+                mainCtx.arc(pt.x, pt.y, 10, 0, Math.PI * 2);
+                mainCtx.fillStyle = '#FF0000';
+                mainCtx.fill();
+                mainCtx.lineWidth = 2;
+                mainCtx.strokeStyle = '#FFFFFF';
+                mainCtx.stroke();
+              } else {
+                mainCtx.arc(pt.x, pt.y, 6, 0, Math.PI * 2);
+                mainCtx.fillStyle = '#00F0FF';
+                mainCtx.fill();
+              }
+            } else if ([4, 12, 16, 20].includes(i)) {
+              // Other Fingertips
+              mainCtx.arc(pt.x, pt.y, 5, 0, Math.PI * 2);
+              mainCtx.fillStyle = '#00F0FF';
+              mainCtx.fill();
+            } else if (i === 0) {
+              // Wrist
+              mainCtx.arc(pt.x, pt.y, 6, 0, Math.PI * 2);
+              mainCtx.fillStyle = '#FFFFFF';
+              mainCtx.fill();
+            } else {
+              // Inner joints
+              mainCtx.arc(pt.x, pt.y, 4, 0, Math.PI * 2);
+              mainCtx.fillStyle = 'rgba(255, 255, 255, 0.85)';
+              mainCtx.fill();
+            }
+          }
+        }
+      }
+    }
+
+    // ==========================================
+    // MediaPipe Hands Initialization
+    // ==========================================
+    const hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+
+    hands.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5
+    });
+
+    hands.onResults(onResults);
+
+    // ==========================================
+    // Camera Streaming
+    // ==========================================
+    let cameraInstance = null;
+
+    function startCamera() {
+      if (cameraInstance) return;
+
+      if (typeof Camera !== 'undefined') {
+        cameraInstance = new Camera(videoElement, {
+          onFrame: async () => {
+            await hands.send({ image: videoElement });
+          },
+          width: 1280,
+          height: 720
+        });
+
+        cameraInstance.start().catch((err) => {
+          console.warn('Camera.start() failed, falling back to getUserMedia:', err);
+          fallbackGetUserMedia();
+        });
+      } else {
+        fallbackGetUserMedia();
+      }
+    }
+
+    // Direct getUserMedia fallback
+    function fallbackGetUserMedia() {
+      navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' }
+      }).then(stream => {
+        videoElement.srcObject = stream;
+        videoElement.play();
+
+        async function processFrame() {
+          if (videoElement.readyState >= 2) {
+            await hands.send({ image: videoElement });
+          }
+          requestAnimationFrame(processFrame);
+        }
+        videoElement.onloadedmetadata = () => {
+          processFrame();
+        };
+      }).catch(err => {
+        console.error('Webcam access error:', err);
+        statusHint.innerHTML = '웹캠 접근이 거부되었거나 사용 불가능합니다.<br><small>브라우저 카메라 권한을 확인해주세요.</small>';
+      });
+    }
+
+    // Auto-start on load + click to handle autoplay policies
+    window.addEventListener('load', () => {
+      startCamera();
+    });
+
+    window.addEventListener('click', () => {
+      startCamera();
+    });
+  </script>
+</body>
+</html>
